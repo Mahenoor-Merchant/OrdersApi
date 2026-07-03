@@ -1,2 +1,6 @@
 fastapi
 uvicorn[standard]
+httpx
+redis
+prometheus_client
+pyjwt
