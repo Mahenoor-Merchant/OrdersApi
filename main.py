@@ -9,7 +9,7 @@ Assigned values:
 import time
 import uuid
 
-from fastapi import FastAPI, Header, Request, Response
+from fastapi import FastAPI, Header, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -29,35 +29,34 @@ app.add_middleware(
     expose_headers=["Retry-After"],
 )
 
-# ---- In-memory storage (fine for this assignment) ----
-# idempotency_store maps: idempotency-key -> the order dict we already created
+# ---- In-memory storage ----
 idempotency_store: dict[str, dict] = {}
-
-# rate_buckets maps: client-id -> list of timestamps of recent requests
 rate_buckets: dict[str, list[float]] = {}
 
 
 # =========================================================
-# 3. PER-CLIENT RATE LIMITING (runs before every request)
+# 3. PER-CLIENT RATE LIMITING
 # =========================================================
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
     client_id = request.headers.get("X-Client-Id")
 
+    # Never rate-limit CORS preflight requests — they must always succeed.
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
     # Only rate-limit requests that actually carry a client id.
     if client_id:
         now = time.time()
-        # keep only timestamps still inside the 10s window
         recent = [t for t in rate_buckets.get(client_id, []) if now - t < WINDOW_SECONDS]
 
         if len(recent) >= RATE_LIMIT:
-            # oldest request in window decides when a slot frees up
             retry_after = int(WINDOW_SECONDS - (now - recent[0])) + 1
             rate_buckets[client_id] = recent
             return JSONResponse(
                 status_code=429,
                 content={"detail": "Rate limit exceeded"},
-                headers={"Retry-After": str(retry_after)},
+                headers={"Retry-After": str(max(retry_after, 1))},
             )
 
         recent.append(now)
@@ -71,13 +70,10 @@ async def rate_limit_middleware(request: Request, call_next):
 # =========================================================
 @app.post("/orders")
 async def create_order(idempotency_key: str | None = Header(default=None, alias="Idempotency-Key")):
-    # If we've seen this key, return the SAME order (HTTP 200, no duplicate).
     if idempotency_key and idempotency_key in idempotency_store:
         return JSONResponse(status_code=200, content=idempotency_store[idempotency_key])
 
-    # Otherwise create a brand-new order.
     order = {"id": str(uuid.uuid4()), "status": "created"}
-
     if idempotency_key:
         idempotency_store[idempotency_key] = order
 
@@ -89,16 +85,10 @@ async def create_order(idempotency_key: str | None = Header(default=None, alias=
 # =========================================================
 @app.get("/orders")
 async def list_orders(limit: int = 10, cursor: str | None = None):
-    # cursor = the next ID to start from. Empty/None means start at 1.
     start = int(cursor) if cursor else 1
-
-    # Grab up to `limit` IDs, never going past TOTAL_ORDERS.
     end = min(start + limit, TOTAL_ORDERS + 1)
     items = [{"id": i, "status": "created"} for i in range(start, end)]
-
-    # If more IDs remain, hand back the next starting ID as the cursor.
     next_cursor = str(end) if end <= TOTAL_ORDERS else None
-
     return {"items": items, "next_cursor": next_cursor}
 
 
