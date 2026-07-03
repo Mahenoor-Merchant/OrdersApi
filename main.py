@@ -31,36 +31,39 @@ app.add_middleware(
 
 # ---- In-memory storage ----
 idempotency_store: dict[str, dict] = {}
-rate_buckets: dict[str, list[float]] = {}
+
+# Per-client fixed-window counter: client_id -> [window_start_ts, count]
+rate_buckets: dict[str, list] = {}
 
 
 # =========================================================
-# 3. PER-CLIENT RATE LIMITING
+# 3. PER-CLIENT RATE LIMITING (fixed 10s window per client)
 # =========================================================
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
-    client_id = request.headers.get("X-Client-Id")
-
-    # Never rate-limit CORS preflight requests — they must always succeed.
+    # CORS preflight must never be blocked.
     if request.method == "OPTIONS":
         return await call_next(request)
 
-    # Only rate-limit requests that actually carry a client id.
+    client_id = request.headers.get("X-Client-Id")
+
+    # Only clients that identify themselves are bucketed. No id -> never limited.
     if client_id:
         now = time.time()
-        recent = [t for t in rate_buckets.get(client_id, []) if now - t < WINDOW_SECONDS]
+        bucket = rate_buckets.get(client_id)
 
-        if len(recent) >= RATE_LIMIT:
-            retry_after = int(WINDOW_SECONDS - (now - recent[0])) + 1
-            rate_buckets[client_id] = recent
-            return JSONResponse(
-                status_code=429,
-                content={"detail": "Rate limit exceeded"},
-                headers={"Retry-After": str(max(retry_after, 1))},
-            )
-
-        recent.append(now)
-        rate_buckets[client_id] = recent
+        # Start a fresh window if none exists or the old one has fully elapsed.
+        if bucket is None or now - bucket[0] >= WINDOW_SECONDS:
+            rate_buckets[client_id] = [now, 1]
+        else:
+            if bucket[1] >= RATE_LIMIT:
+                retry_after = int(WINDOW_SECONDS - (now - bucket[0])) + 1
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": "Rate limit exceeded"},
+                    headers={"Retry-After": str(max(retry_after, 1))},
+                )
+            bucket[1] += 1
 
     return await call_next(request)
 
